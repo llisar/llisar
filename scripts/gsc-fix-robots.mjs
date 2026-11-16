@@ -48,44 +48,56 @@ async function tokenFromRefresh() {
   return json.access_token
 }
 
-async function tokenFromAdc() {
+function loadAdc() {
   const path =
     process.env.GOOGLE_APPLICATION_CREDENTIALS ||
     join(homedir(), '.config/gcloud/application_default_credentials.json')
   if (!existsSync(path)) return null
-  const creds = JSON.parse(readFileSync(path, 'utf8'))
-  if (creds.type === 'authorized_user') {
-    const res = await fetch('https://oauth2.googleapis.com/token', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({
-        client_id: creds.client_id,
-        client_secret: creds.client_secret,
-        refresh_token: creds.refresh_token,
-        grant_type: 'refresh_token',
-      }),
-    })
-    const json = await res.json()
-    if (!res.ok) throw new Error(`ADC refresh: ${JSON.stringify(json)}`)
-    return json.access_token
+  return JSON.parse(readFileSync(path, 'utf8'))
+}
+
+async function tokenFromAdc(creds) {
+  if (!creds || creds.type !== 'authorized_user') return null
+  const res = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      client_id: creds.client_id,
+      client_secret: creds.client_secret,
+      refresh_token: creds.refresh_token,
+      grant_type: 'refresh_token',
+    }),
+  })
+  const json = await res.json()
+  if (!res.ok) throw new Error(`ADC refresh: ${JSON.stringify(json)}`)
+  return json.access_token
+}
+
+async function getAuth() {
+  const fromEnv = await tokenFromRefresh()
+  if (fromEnv) {
+    return { accessToken: fromEnv, quotaProject: process.env.GOOGLE_CLOUD_PROJECT || null }
   }
+  const creds = loadAdc()
+  if (!creds) return null
   if (creds.type === 'service_account') {
     throw new Error(
       'Service account ADC needs JWT flow; use authorized_user or GSC_* refresh env',
     )
   }
-  return null
+  const accessToken = await tokenFromAdc(creds)
+  return {
+    accessToken,
+    quotaProject: creds.quota_project_id || process.env.GOOGLE_CLOUD_PROJECT || null,
+  }
 }
 
-async function getAccessToken() {
-  return (await tokenFromRefresh()) || (await tokenFromAdc())
-}
-
-async function gscFetch(accessToken, path, { method = 'GET', body } = {}) {
-  const res = await fetch(`https://www.googleapis.com${path}`, {
+async function gscFetch(auth, host, path, { method = 'GET', body } = {}) {
+  const res = await fetch(`${host}${path}`, {
     method,
     headers: {
-      Authorization: `Bearer ${accessToken}`,
+      Authorization: `Bearer ${auth.accessToken}`,
+      ...(auth.quotaProject ? { 'x-goog-user-project': auth.quotaProject } : {}),
       ...(body ? { 'Content-Type': 'application/json' } : {}),
     },
     body: body ? JSON.stringify(body) : undefined,
@@ -101,8 +113,8 @@ async function gscFetch(accessToken, path, { method = 'GET', body } = {}) {
 }
 
 async function main() {
-  const accessToken = await getAccessToken()
-  if (!accessToken) {
+  const auth = await getAuth()
+  if (!auth?.accessToken) {
     console.error(
       'No GSC credentials. Set GSC_CLIENT_ID/SECRET/REFRESH_TOKEN or run gcloud ADC login.',
     )
@@ -111,19 +123,16 @@ async function main() {
 
   const sitePath = encodeURIComponent(SITE)
   const feedPath = encodeURIComponent(SITEMAP)
+  const wm = 'https://www.googleapis.com'
+  const sc = 'https://searchconsole.googleapis.com'
 
   console.log('Submitting sitemap', SITEMAP)
-  const put = await gscFetch(
-    accessToken,
-    `/webmasters/v3/sites/${sitePath}/sitemaps/${feedPath}`,
-    { method: 'PUT' },
-  )
+  const put = await gscFetch(auth, wm, `/webmasters/v3/sites/${sitePath}/sitemaps/${feedPath}`, {
+    method: 'PUT',
+  })
   console.log('sitemap:', put.status, put.ok ? 'ok' : put.json)
 
-  const listed = await gscFetch(
-    accessToken,
-    `/webmasters/v3/sites/${sitePath}/sitemaps`,
-  )
+  const listed = await gscFetch(auth, wm, `/webmasters/v3/sites/${sitePath}/sitemaps`)
   console.log('sitemaps list:', listed.status)
   if (listed.json?.sitemap) {
     for (const s of listed.json.sitemap) {
@@ -133,30 +142,27 @@ async function main() {
 
   console.log('\nURL Inspection (robots / index state):')
   for (const url of PAGES) {
-    const insp = await gscFetch(
-      accessToken,
-      `/v1/urlInspection/index:inspect`,
-      {
-        method: 'POST',
-        body: { inspectionUrl: url, siteUrl: SITE },
-      },
-    )
+    const insp = await gscFetch(auth, sc, `/v1/urlInspection/index:inspect`, {
+      method: 'POST',
+      body: { inspectionUrl: url, siteUrl: SITE },
+    })
     if (!insp.ok) {
       console.log('-', url, 'FAIL', insp.status, insp.json)
       continue
     }
     const i = insp.json?.inspectionResult?.indexStatusResult || {}
-    const r = insp.json?.inspectionResult?.indexStatusResult?.robotsTxtState
     const verdict = i.verdict || i.coverageState || '?'
     console.log(
       '-',
       url,
       '| robots:',
-      r || i.robotsTxtState || '?',
+      i.robotsTxtState || '?',
       '|',
       verdict,
       '|',
       i.indexingState || '',
+      '|',
+      i.coverageState || '',
     )
   }
 }
